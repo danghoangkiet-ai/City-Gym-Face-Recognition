@@ -1,0 +1,12 @@
+**/bin/
+**/obj/
+.tools/
+node_modules/
+ai/models/*.onnx
+ai/models/*.partial
+artifacts/
+.local/
+*.user
+.env
+.env.*
+!.env.example

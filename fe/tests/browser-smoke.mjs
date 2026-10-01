@@ -1,0 +1,124 @@
+// Run the local server, then Chrome with --headless=new --remote-debugging-port=9223 and a dedicated test profile.
+import {writeFile, mkdir} from 'node:fs/promises';
+import assert from 'node:assert/strict';
+const pages = await (await fetch('http://127.0.0.1:9223/json')).json();
+const target = pages.find(p => p.type === 'page' && p.url.startsWith('http://127.0.0.1:5173'));
+assert.ok(target,'Local management page must be open');
+const socket = new WebSocket(target.webSocketDebuggerUrl);
+await new Promise((resolve,reject) => {socket.onopen=resolve;socket.onerror=reject;});
+let id = 0; const pending = new Map(), errors = [];
+socket.onmessage = event => {
+  const message = JSON.parse(event.data);
+  if (message.method === 'Runtime.exceptionThrown') errors.push(message.params.exceptionDetails.text);
+  if (message.id) { const p = pending.get(message.id); pending.delete(message.id); message.error ? p.reject(message.error) : p.resolve(message.result); }
+};
+const call = (method,params={}) => new Promise((resolve,reject) => {const key=++id;pending.set(key,{resolve,reject});socket.send(JSON.stringify({id:key,method,params}));});
+const evaluate = async expression => {
+  const result = await call('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true});
+  if(result.exceptionDetails) throw new Error(JSON.stringify(result.exceptionDetails));
+  return result.result.value;
+};
+const settle = () => new Promise(resolve => setTimeout(resolve,150));
+try {
+  await call('Runtime.enable'); await call('Page.enable');
+  await evaluate("localStorage.clear();sessionStorage.clear();location.reload()"); await settle();
+  await evaluate("document.querySelector('[name=password]').value='CityGymDemo!';document.getElementById('login-form').requestSubmit()"); await settle();
+  assert.equal(await evaluate("document.getElementById('workspace').hidden"),false);
+  await evaluate("{document.getElementById('add-member').click();const f=document.getElementById('member-form');f.elements.name.value='QA Member';f.elements.code.value='QA-01';f.requestSubmit()}"); await settle();
+  assert.equal(await evaluate("document.getElementById('total-count').textContent"),'1');
+  await evaluate("{document.querySelector('[data-page=members]').click();document.querySelector('[data-edit]').click();const f=document.getElementById('member-form');f.elements.status.value='paused';f.requestSubmit()}"); await settle();
+  assert.equal(await evaluate("document.getElementById('active-count').textContent"),'0');
+  await evaluate("location.reload()"); await settle();
+  assert.equal(await evaluate("document.getElementById('total-count').textContent"),'1');
+  await evaluate("document.querySelector('[data-page=members]').click();document.getElementById('search').value='missing';document.getElementById('search').dispatchEvent(new Event('input'))");
+  assert.equal(await evaluate("document.getElementById('members-empty').hidden"),false);
+  await evaluate("document.getElementById('search').value='';document.getElementById('search').dispatchEvent(new Event('input'));window.confirm=()=>true;document.querySelector('[data-delete]').click()"); await settle();
+  assert.equal(await evaluate("document.getElementById('total-count').textContent"),'0');
+  await evaluate("document.querySelector('[data-page=recognition]').click()");
+  assert.equal(await evaluate("document.getElementById('service-enrolled').textContent"),'1');
+  assert.equal(await evaluate("document.getElementById('identify-feature').disabled"),true);
+  await evaluate(`(async()=>{const c=document.createElement('canvas');c.width=64;c.height=64;const b=await new Promise(r=>c.toBlob(r,'image/png'));const d=new DataTransfer();d.items.add(new File([b],'ui-test.png',{type:'image/png'}));const input=document.getElementById('recognition-image');input.files=d.files;input.dispatchEvent(new Event('change'));})()`);await settle();
+  await evaluate("document.getElementById('extract-feature').click()");await settle();
+  assert.equal(await evaluate("document.getElementById('identify-feature').disabled"),false);
+  assert.ok(await evaluate("document.getElementById('feature-summary').textContent.includes('128')"));
+  await evaluate("document.getElementById('identify-feature').click()");await settle();
+  assert.ok(await evaluate("document.getElementById('recognition-result').textContent.includes('MÔ PHỎNG')"));
+  await evaluate("document.getElementById('demo-scenario').value='unknown';document.getElementById('identify-image').click()");await settle();
+  assert.ok(await evaluate("document.getElementById('recognition-result').textContent.includes('Không tìm thấy')"));
+  for(const code of ['NO_FACE','MULTIPLE_FACES','FORBIDDEN']){
+    await evaluate(`document.getElementById('demo-scenario').value='${code}';document.getElementById('identify-image').click()`);await settle();
+    assert.ok(await evaluate(`document.getElementById('recognition-error').textContent.includes('${code}')`));
+  }
+  await evaluate("document.getElementById('demo-scenario').value='match';document.getElementById('recognition-face').value='demo-face-01';document.getElementById('recognition-face').dispatchEvent(new Event('change'));document.getElementById('delete-embedding').click()");await settle();
+  assert.equal(await evaluate("document.getElementById('service-enrolled').textContent"),'0');
+  assert.equal(await evaluate("document.querySelectorAll('#face-rows tr').length"),2);
+  await evaluate("document.getElementById('identify-image').click()");await settle();
+  assert.ok(await evaluate("document.getElementById('recognition-error').textContent.includes('EMPTY_GALLERY')"));
+  await evaluate("document.getElementById('enroll-image').click()");await settle();
+  assert.equal(await evaluate("document.getElementById('service-enrolled').textContent"),'1');
+  await evaluate("document.getElementById('extract-feature').click()");await settle();
+  await call('Emulation.setDeviceMetricsOverride',{width:1440,height:1100,deviceScaleFactor:1,mobile:false});
+  await mkdir(new URL('../../artifacts/',import.meta.url),{recursive:true});
+  const recognition=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true});
+  await writeFile(new URL('../../artifacts/recognition-desktop.png',import.meta.url),Buffer.from(recognition.data,'base64'));
+  await call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+  assert.ok(await evaluate('document.documentElement.scrollWidth <= innerWidth'),'Recognition mobile overflow');
+  const recognitionMobile=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true});
+  await writeFile(new URL('../../artifacts/recognition-mobile.png',import.meta.url),Buffer.from(recognitionMobile.data,'base64'));
+  await evaluate("document.getElementById('recognition-terminal').value='demo-terminal-02';document.getElementById('recognition-terminal').dispatchEvent(new Event('change'))");await settle();
+  assert.equal(await evaluate("document.getElementById('identify-feature').disabled"),true);
+  assert.equal(await evaluate("document.getElementById('recognition-image').files.length"),0);
+  assert.equal(await evaluate("document.querySelectorAll('#gallery-rows tr').length"),0);
+  assert.ok(await evaluate("!JSON.stringify(localStorage).includes('vector')"));
+  await evaluate("document.querySelector('[data-page=overview]').click()");
+  await call('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});
+  await mkdir(new URL('../../artifacts/',import.meta.url),{recursive:true});
+  const desktop = await call('Page.captureScreenshot',{format:'png'});
+  await writeFile(new URL('../../artifacts/management-desktop.png',import.meta.url),Buffer.from(desktop.data,'base64'));
+  await call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+  assert.ok(await evaluate('document.documentElement.scrollWidth <= innerWidth'),'No mobile horizontal overflow');
+  const mobile = await call('Page.captureScreenshot',{format:'png'});
+  await writeFile(new URL('../../artifacts/management-mobile.png',import.meta.url),Buffer.from(mobile.data,'base64'));
+  await evaluate("document.getElementById('logout').click()");
+  assert.equal(await evaluate("document.getElementById('workspace').hidden"),true);
+  // Backend contract test: browser fetch is mocked only inside this test, never in production API mode.
+  await evaluate(`(()=>{
+    window.__calls=[];window.__unauthorized=false;window.__originalFetch=window.fetch;
+    const feature={model:'opencv-sface-2021dec',pipeline:'yunet2023mar-similarity5-sface128-v1',dimension:128,vector:Array.from({length:128},(_,i)=>i===0?1:0)};
+    window.fetch=async(url,options={})=>{
+      window.__calls.push({url,method:options.method,csrf:options.headers?.['X-CSRF-Token']});
+      if(window.__unauthorized)return new Response(JSON.stringify({code:'UNAUTHORIZED',message:'Session expired'}),{status:401});
+      let data={};
+      if(url==='/api/auth/csrf')data={csrfToken:'csrf-before-login'};
+      else if(url==='/api/auth/login'||url==='/api/auth/session')data={name:'Manager Test',role:'Manager',expiresAt:new Date(Date.now()+3600000).toISOString(),csrfToken:'csrf-session'};
+      else if(url==='/api/management/workspace')data={revision:'1',data:{version:1,members:[],settings:{gymName:'API Gym',location:'Server'}}};
+      else if(url==='/api/terminals')data=[{id:'api-terminal',name:'Terminal API',status:'active'}];
+      else if(url.startsWith('/api/face-infos?'))data=[{id:'api-face',fullName:'Server Face',memberCode:'SERVER-01',status:'active'}];
+      else if(url.includes('/gallery'))data=[];
+      else if(url.includes('/status?'))data={ready:true,workerCount:1,active:0,pending:0,enrolledFaces:0};
+      else if(url.endsWith('/extract/feature'))data=feature;
+      else if(url.endsWith('/identify/feature'))data={found:false,score:0.1};
+      return new Response(JSON.stringify(data),{status:200,headers:{'Content-Type':'application/json'}});
+    };
+    document.getElementById('login-mode').value='api';document.getElementById('login-mode').dispatchEvent(new Event('change'));
+    document.querySelector('[name=email]').value='manager@example.test';document.querySelector('[name=password]').value='api-password';document.getElementById('login-form').requestSubmit();
+  })()`);await settle();
+  assert.equal(await evaluate("document.getElementById('workspace').hidden"),false);
+  assert.ok(await evaluate("document.getElementById('recognition-mode').textContent.includes('BACKEND API')"));
+  assert.equal(await evaluate("document.getElementById('demo-scenario-label').hidden"),true);
+  assert.equal(await evaluate("document.querySelector('[data-page=storage]').hidden"),true);
+  await evaluate("document.querySelector('[data-page=recognition]').click()");
+  await evaluate(`(async()=>{const c=document.createElement('canvas');c.width=64;c.height=64;const b=await new Promise(r=>c.toBlob(r));const d=new DataTransfer();d.items.add(new File([b],'api-test.png',{type:'image/png'}));const i=document.getElementById('recognition-image');i.files=d.files;i.dispatchEvent(new Event('change'));})()`);await settle();
+  await evaluate("document.getElementById('extract-feature').click()");await settle();
+  assert.equal(await evaluate("document.getElementById('identify-feature').disabled"),false);
+  await evaluate("document.getElementById('identify-feature').click()");await settle();
+  assert.ok(await evaluate("window.__calls.some(c=>c.url==='/api/face-recognition/identify/feature'&&c.csrf==='csrf-session')"));
+  assert.ok(await evaluate("!JSON.stringify(sessionStorage).includes('csrf-session')"));
+  await evaluate("window.__unauthorized=true;document.getElementById('refresh-recognition').click()");await settle();
+  assert.equal(await evaluate("document.getElementById('workspace').hidden"),true);
+  assert.equal(await evaluate("document.getElementById('recognition-image').files.length"),0);
+  assert.equal(await evaluate("document.getElementById('identify-feature').disabled"),true);
+  await evaluate("window.fetch=window.__originalFetch;document.getElementById('login-mode').value='demo';document.getElementById('login-mode').dispatchEvent(new Event('change'))");
+  assert.deepEqual(errors,[]);
+  console.log('Browser smoke passed: management CRUD; recognition demo actions/errors; gallery scope; feature cleanup; mobile; API contract with mock HTTP, CSRF, and session expiry.');
+} finally { socket.close(); }
